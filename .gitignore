@@ -19,3 +19,5 @@ tmp
 .kitchen.local.yml
 Dockerfile
 .DS_Store
+bin/*
+.idea/*
