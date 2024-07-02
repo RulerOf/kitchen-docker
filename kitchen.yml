@@ -12,6 +12,11 @@ transport:
 provisioner:
   name: dummy
 
+verifier:
+  name: inspec
+  inspec_tests:
+    - test/integration/inspec
+
 platforms:
   - name: amazonlinux-2
   - name: ubuntu-18.04
@@ -58,5 +63,4 @@ suites:
   - name: inspec
     driver:
       provision_command: true
-    verifier:
-      name: inspec
+
