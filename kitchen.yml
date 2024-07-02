@@ -74,4 +74,3 @@ suites:
   - name: inspec
     driver:
       provision_command: true
-
