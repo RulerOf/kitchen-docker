@@ -6,6 +6,9 @@ group :development do
   # Integration testing gems.
   gem 'kitchen-inspec', '~> 2.0'
   gem 'train', '>= 2.1', '< 4.0' # validate 4.x when it's released
+  # Silence ruby 3.4.0 standard gem deprecation warnings
+  gem 'csv', '~> 3.3.0'
+  gem 'syslog', '~> 0.1.1'
 end
 
 group :test do
