@@ -71,6 +71,3 @@ suites:
   - name: amd64
     driver:
       docker_platform: linux/amd64
-  - name: inspec
-    driver:
-      provision_command: true
