@@ -8,79 +8,81 @@ jobs:
   lint-unit:
     uses: test-kitchen/.github/.github/workflows/lint-unit.yml@main
 
-  integration-windows:
-    name: Windows ${{matrix.suite}} ${{matrix.os}}
-    runs-on: windows-latest
+  build-matrix:
+    name: Build test matrix from test-kitchen config
+    runs-on: ubuntu-latest
     needs: lint-unit
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+      - name: Discover Windows suites
+        id: windows
+        run: |
+          cat << "EORUBY" | bundle exec ruby >> "$GITHUB_OUTPUT"
+            require 'inspec'
+            require 'kitchen'
+
+            windows_loader = Kitchen::Loader::YAML.new(project_config: './kitchen.windows.yml')
+            windows_suites = Kitchen::Config.new(loader: windows_loader).instances.map { |instance| instance.name }
+
+            puts "suites=#{windows_suites.to_json}"
+          EORUBY
+      - name: Discover Linux suites
+        id: linux
+        run: |
+          cat << "EORUBY" | bundle exec ruby >> "$GITHUB_OUTPUT"
+            require 'inspec'
+            require 'kitchen'
+
+            linux_loader = Kitchen::Loader::YAML.new(project_config: './kitchen.yml')
+            linux_suites = Kitchen::Config.new(loader: linux_loader).instances.map { |instance| instance.name }
+
+            puts "suites=#{linux_suites.to_json}"
+          EORUBY
+    outputs:
+      windows-suites: ${{ steps.windows.outputs.suites }}
+      linux-suites: ${{ steps.linux.outputs.suites }}
+
+  integration-windows:
+    name: Windows ${{matrix.suite}}
+    runs-on: windows-latest
+    needs:
+      - build-matrix
     strategy:
       fail-fast: false
       matrix:
-        suite: [default]
-        os: [ubuntu-24.04]
-        ruby: ["3.3"]
+        suite: ${{ fromJson(needs.build-matrix.outputs.windows-suites) }}
     steps:
       - uses: actions/checkout@v4
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: ${{ matrix.ruby }}
+          ruby-version: "3.3"
           bundler-cache: true
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      - run: bundle exec kitchen test ${{ matrix.suite }}-${{ matrix.os }} -l debug
+      - run: bundle exec kitchen test ${{ matrix.suite }} -l debug
 
   integration-linux:
-    name: Linux ${{matrix.suite}} ${{matrix.os}}
+    name: Linux ${{matrix.suite}}
     runs-on: ubuntu-latest
-    needs: lint-unit
+    needs:
+      - build-matrix
     strategy:
       fail-fast: false
       matrix:
-        suite:
-          - default
-          - no-build-context
-          - arm64
-          - amd64
-          - inspec
-        os:
-          - amazonlinux-2023
-          - ubuntu-2204
-          - ubuntu-2404
-          - fedora-latest
-          - almalinux-9
-          - rockylinux-9
-          - debian-12
-          - opensuse-15
-          - dockerfile
-        ruby: ["3.3"]
+        suite: ${{ fromJson(needs.build-matrix.outputs.linux-suites) }}
     steps:
       - uses: actions/checkout@v4
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: ${{ matrix.ruby }}
+          ruby-version: "3.3"
           bundler-cache: true
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      - run: bundle exec kitchen test ${{ matrix.suite }}-${{ matrix.os }} -l debug
-
-  integration-capabilities:
-    name: Linux ${{matrix.suite}} ${{matrix.os}}
-    runs-on: ubuntu-latest
-    needs: lint-unit
-    strategy:
-      fail-fast: false
-      matrix:
-        suite:
-          - capabilities
-        os: [debian-12, ubuntu-2204, ubuntu-2404]
-        ruby: ["3.3"]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: ${{ matrix.ruby }}
-          bundler-cache: true
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - run: bundle exec kitchen test ${{ matrix.suite }}-${{ matrix.os }} -l debug
+      - run: bundle exec kitchen test ${{ matrix.suite }} -l debug
