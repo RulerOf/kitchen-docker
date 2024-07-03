@@ -39,9 +39,9 @@ platforms:
   - name: opensuse-15.5
     driver:
       image: opensuse/leap:15.5
-  - name: opensuse-15.6
+  - name: opensuse-15-latest
     driver:
-      image: opensuse/leap:15.6
+      image: opensuse/leap:15
   - name: dockerfile
     driver:
       username: dockerfile
