@@ -18,7 +18,7 @@ require_relative "../docker/container/windows"
 
 require_relative "../docker/helpers/inspec_helper"
 
-# require_relative "../../docker/version"
+require_relative "../../docker/version"
 require_relative "../../train/docker"
 
 module Kitchen
