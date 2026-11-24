@@ -19,14 +19,34 @@ require_relative "container_helper"
 
 module Kitchen
   module Docker
+    # Mixins shared by the driver, transport, and container classes.
     module Helpers
+      # Building, inspecting, and removing Docker images.
       module ImageHelper
         include Configurable
         include Kitchen::Docker::Helpers::CliHelper
         include Kitchen::Docker::Helpers::ContainerHelper
 
+        # An id on a line of its own, which is all `docker build -q` prints.
+        QUIET_BUILD_IMAGE_ID = /\A(sha256:[[:xdigit:]]{64})\z/
+
+        # Pulls the built image's id out of `docker build` output.
+        #
+        # Scanned in reverse, and against several patterns, because the wording has
+        # changed across Docker and BuildKit versions.
+        #
+        # @param output [String] the build output
+        # @return [String] the image id
+        # @raise [Kitchen::ActionFailed] if no id could be found
         def parse_image_id(output)
           output.split("\n").reverse_each do |line|
+            line = line.strip
+            # `docker build -q` prints the id and nothing else -- none of the
+            # wording below appears -- so a build with `build_options: -q` had
+            # no line any of these matched and failed with "Could not parse
+            # Docker build output for image ID" (#225).
+            return Regexp.last_match(1) if line.match(QUIET_BUILD_IMAGE_ID)
+
             if line =~ /writing image (sha256:[[:xdigit:]]{64})(?: \d*\.\ds)? done/i
               img_id = line[/writing image (sha256:[[:xdigit:]]{64})(?: \d*\.\ds)? done/i, 1]
               return img_id
@@ -44,6 +64,10 @@ module Kitchen
           raise ActionFailed, "Could not parse Docker build output for image ID"
         end
 
+        # Removes the built image, unless a container is still using it.
+        #
+        # @param state [Hash] instance state naming the image
+        # @return [void]
         def remove_image(state)
           image_id = state[:image_id]
           if image_in_use?(state)
@@ -54,10 +78,40 @@ module Kitchen
           end
         end
 
+        # Whether any container was created from the image.
+        #
+        # Asked with a filter rather than by searching `docker ps -a` output for
+        # the id. That output abbreviates the IMAGE column to twelve characters,
+        # while state carries the full +sha256:+ digest, so the substring never
+        # matched and the answer was always false -- which defeated the guard
+        # entirely and let {#remove_image} run `docker rmi` against an image a
+        # container was still using.
+        #
+        # @param state [Hash] instance state naming the image
+        # @return [Boolean] whether any container references it
         def image_in_use?(state)
-          docker_command("ps -a", suppress_output: !logger.debug?).include?(state[:image_id])
+          return false unless state[:image_id]
+
+          output = docker_command("ps -a -q --filter ancestor=#{state[:image_id]}",
+            suppress_output: !logger.debug?)
+
+          # Matched line by line rather than by emptiness, so a warning docker
+          # writes to stderr is not mistaken for a container id.
+          output.lines.map(&:strip).any? do |line|
+            line.match?(/\A[0-9a-f]{12}(?:[0-9a-f]{52})?\z/)
+          end
         end
 
+        # Builds the image from the given Dockerfile.
+        #
+        # The Dockerfile is written to a temp file and also passed on stdin, so the
+        # build works both with a build context and without one. The temp file is
+        # removed whether or not the build succeeded.
+        #
+        # @param state [Hash] instance state
+        # @param dockerfile [String] the Dockerfile contents
+        # @return [String] the new image's id
+        # @raise [Kitchen::ActionFailed] if the id cannot be parsed from the output
         def build_image(state, dockerfile)
           cmd = "build"
           cmd << " --no-cache" unless config[:use_cache]
@@ -82,8 +136,28 @@ module Kitchen
           parse_image_id(output)
         end
 
+        # Whether the image named in state is present locally.
+        #
+        # The inspect is silenced, as every other predicate that shells out to
+        # docker is. Left speaking, `kitchen destroy` on an instance with
+        # +remove_images+ set printed the image's entire `docker inspect` JSON
+        # -- config, every layer digest, metadata -- into the middle of the
+        # destroy output, between the container being removed and the image
+        # being removed. Nothing read it: only whether the command succeeded is
+        # used.
+        #
+        # It is still printed under `-l debug`, where the rest of the driver's
+        # docker traffic is.
+        #
+        # @param state [Hash] instance state naming the image
+        # @return [Boolean] whether the image is present locally
         def image_exists?(state)
-          state[:image_id] && !!docker_command("inspect --type=image #{state[:image_id]}") rescue false
+          return false unless state[:image_id]
+
+          !!docker_command("inspect --type=image #{state[:image_id]}",
+            suppress_output: !logger.debug?)
+        rescue
+          false
         end
       end
     end

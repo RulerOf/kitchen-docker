@@ -18,20 +18,47 @@ require_relative "helpers/image_helper"
 
 module Kitchen
   module Docker
+    # Base class for the container the instance under test runs in.
+    #
+    # Holds the behaviour that is the same on every platform -- checking
+    # whether the container exists, removing it, working out its address, and
+    # copying files in. {Linux} and {Windows} add how the image is built and
+    # how commands are run, which share almost nothing.
     class Container
       include Kitchen::Docker::Helpers::CliHelper
       include Kitchen::Docker::Helpers::ContainerHelper
       include Kitchen::Docker::Helpers::FileHelper
       include Kitchen::Docker::Helpers::ImageHelper
 
+      # @param config [Hash] the driver or transport configuration
       def initialize(config)
         @config = config
       end
 
+      # Checks the container named in state and records the login user.
+      #
+      # A state file naming a container that no longer exists is an error rather
+      # than something to build over, because the stale id usually means the
+      # container was removed behind Test Kitchen's back and silently creating a
+      # new one would hide that.
+      #
+      # A container that exists but has stopped is also an error, and a separate
+      # one: it is still there to be cleaned up, so the message points at
+      # `kitchen destroy` rather than claiming the container is gone.
+      #
+      # @param state [Hash] mutable instance state; gains +username+
+      # @return [void]
+      # @raise [Kitchen::ActionFailed] if state names a container that is gone,
+      #   or one that exists but is not running
       def create(state)
         if container_exists?(state)
+          unless container_running?(state)
+            raise ActionFailed, "Container ID #{state[:container_id]} was found in the kitchen state data, " \
+                                "but the container is not running. Run `kitchen destroy` to remove it."
+          end
+
           info("Container ID #{state[:container_id]} already exists.")
-        elsif !container_exists?(state) && state[:container_id]
+        elsif state[:container_id]
           raise ActionFailed, "Container ID #{state[:container_id]} was found in the kitchen state data, " \
                               "but the container does not exist."
         end
@@ -39,6 +66,10 @@ module Kitchen
         state[:username] = @config[:username]
       end
 
+      # Removes the container, and its image when +remove_images+ is set.
+      #
+      # @param state [Hash] instance state naming the container
+      # @return [void]
       def destroy(state)
         info("[Docker] Destroying Docker container #{state[:container_id]}") if state[:container_id]
         remove_container(state) if container_exists?(state)
@@ -48,6 +79,14 @@ module Kitchen
         end
       end
 
+      # Works out the address Test Kitchen should connect to.
+      #
+      # A remote Docker socket means the container is reachable at the socket's
+      # own host; +use_internal_docker_network+ means its container IP; anything
+      # else is a published port on localhost.
+      #
+      # @param state [Hash] instance state naming the container
+      # @return [String] a hostname or IP address
       def hostname(state)
         hostname = "localhost"
 
@@ -60,6 +99,11 @@ module Kitchen
         hostname
       end
 
+      # Copies local files into the container.
+      #
+      # @param locals [String, Array<String>] one path or several
+      # @param remote [String] destination path inside the container
+      # @return [Array<String>] the files copied
       def upload(locals, remote)
         files = locals
         files = Array(locals) unless locals.is_a?(Array)

@@ -22,15 +22,28 @@ require_relative "../helpers/dockerfile_helper"
 module Kitchen
   module Docker
     class Container
+      # A Linux container, reached over SSH.
+      #
+      # The generated image installs and runs an SSH server, and Test Kitchen
+      # connects to a published port with a generated key. That is why the
+      # Dockerfile here is so much larger than the Windows one.
       class Linux < Kitchen::Docker::Container
         include Kitchen::Docker::Helpers::DockerfileHelper
 
+        # Serializes SSH key generation across concurrently running instances,
+        # which share one key path.
         MUTEX_FOR_SSH_KEYS = Mutex.new
 
+        # @param config [Hash] the driver configuration
         def initialize(config)
           super
         end
 
+        # Builds the image, runs the container, and publishes its SSH port.
+        #
+        # @param state [Hash] mutable instance state; gains +ssh_key+, +image_id+,
+        #   +container_id+, +hostname+, and +port+
+        # @return [void]
         def create(state)
           super
 
@@ -44,6 +57,15 @@ module Kitchen
           state[:port] = container_ssh_port(state)
         end
 
+        # Runs a command in the container by uploading it as a shell script.
+        #
+        # The command is written to a temp file and executed with bash rather than
+        # passed on the command line, which keeps long converge scripts clear of
+        # argument-length and quoting limits.
+        #
+        # @param command [String] the shell code to run
+        # @return [String] the command's combined output
+        # @raise [RuntimeError] if the command fails
         def execute(command)
           # Create temp script file and upload files to container
           debug("Executing command on Linux container (Platform: #{@config[:platform]})")
@@ -58,20 +80,33 @@ module Kitchen
           debug("Uploading temp file #{temp_file} to #{remote_path} on container")
           upload(temp_file, remote_path)
 
-          debug("Deleting temp file from local filesystem")
-          ::File.delete(temp_file)
-
           # Replace any environment variables used in the path and execute script file
           debug("Executing temp script #{remote_path}/#{filename} on container")
           remote_path = replace_env_variables(@config, remote_path)
 
-          container_exec(@config, "/bin/bash #{remote_path}/#{filename}")
+          # Escaped because the exec command line is assembled as one string:
+          # a temp_dir with a space in it was split before docker saw it, and
+          # bash was handed the first half of the directory as the script.
+          container_exec(@config, "/bin/bash #{Shellwords.escape("#{remote_path}/#{filename}")}")
         rescue => e
           raise "Failed to execute command on Linux container. #{e}"
+        ensure
+          # Removed here rather than after the upload, so that a failure part
+          # way through does not leave the script behind in .kitchen/temp.
+          if temp_file && ::File.exist?(temp_file)
+            debug("Deleting temp file from local filesystem")
+            ::File.delete(temp_file)
+          end
         end
 
         protected
 
+        # Generates the SSH keypair used to log into Linux containers.
+        #
+        # Guarded by {MUTEX_FOR_SSH_KEYS} because concurrent instances share one
+        # key path and would otherwise write the file while another reads it.
+        #
+        # @return [void]
         def generate_keys
           MUTEX_FOR_SSH_KEYS.synchronize do
             if !File.exist?(@config[:public_key]) || !File.exist?(@config[:private_key])
@@ -90,13 +125,40 @@ module Kitchen
           end
         end
 
+        # Pulls the published port out of `docker port` output.
+        #
+        # One line is printed per published binding, and the host part varies:
+        #
+        #   0.0.0.0:32768
+        #   [::]:32768
+        #
+        # The port is taken from the end of the line rather than by splitting on
+        # ":" from the left, because an IPv6 host contains colons of its own --
+        # splitting left-to-right returned "" for those, and "".to_i is 0, so a
+        # daemon publishing on IPv6 handed Test Kitchen port 0 to connect to.
+        #
+        # @param output [String] e.g. +"0.0.0.0:32768\n[::]:32768\n"+
+        # @return [Integer] the host-side port
+        # @raise [Kitchen::ActionFailed] if no port could be found
         def parse_container_ssh_port(output)
-          _host, port = output.split(":")
+          port = output.lines.filter_map { |line| line[/:(\d+)\s*\z/, 1] }.first
+
+          if port.nil?
+            raise ActionFailed, "Could not parse Docker port output for container SSH port: #{output.inspect}"
+          end
+
           port.to_i
-        rescue => e
-          raise ActionFailed, "Could not parse Docker port output for container SSH port. #{e}"
         end
 
+        # The port Test Kitchen should connect to for SSH.
+        #
+        # On the internal Docker network the container is reached directly, so the
+        # unmapped port 22 is correct; otherwise Docker's published mapping is
+        # looked up.
+        #
+        # @param state [Hash] instance state naming the container
+        # @return [Integer] the port to connect on
+        # @raise [Kitchen::ActionFailed] if no SSH port is mapped
         def container_ssh_port(state)
           return 22 if @config[:use_internal_docker_network]
 
@@ -106,6 +168,14 @@ module Kitchen
           raise ActionFailed, "Docker reports container has no ssh port mapped. #{e}"
         end
 
+        # Builds the Dockerfile for a Linux container.
+        #
+        # A configured +dockerfile+ is used as-is after ERB rendering. Otherwise
+        # one is generated: the base image, proxy settings, the platform's own
+        # package setup, any +provision_command+ entries, and the generated public
+        # key appended to the login user's authorized_keys.
+        #
+        # @return [String] the Dockerfile contents
         def dockerfile
           return dockerfile_template if @config[:dockerfile]
 

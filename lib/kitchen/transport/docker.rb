@@ -15,29 +15,41 @@ require "kitchen"
 
 require_relative "../docker/container/linux"
 require_relative "../docker/container/windows"
+require_relative "../docker/docker_version"
 
 require_relative "../docker/helpers/inspec_helper"
 
 # require_relative "../../docker/version"
 
 module Kitchen
+  # Test Kitchen's transport plugins.
   module Transport
+    # Test Kitchen transport that runs commands inside a Docker container.
+    #
+    # Commands go through `docker exec` rather than a network protocol, so no
+    # SSH or WinRM server is needed inside the image.
     class Docker < Kitchen::Transport::Base
+      # Raised when a docker command against the container fails.
       class DockerFailed < TransportFailed; end
 
-      # kitchen_transport_api_version 1
-      plugin_version Kitchen::VERSION
+      # Reported by `kitchen diagnose`. plugin_version was Kitchen::VERSION,
+      # which is Test Kitchen's version rather than this gem's, so a diagnose
+      # reported the transport as 4.1.1 while kitchen-docker was at 3.3.4.
+      kitchen_transport_api_version 1
+      plugin_version Kitchen::Docker::DOCKER_VERSION
 
       default_config :binary,        "docker"
       default_config :env_variables, nil
       default_config :interactive,   false
       default_config :privileged,    false
+      default_config :sudo_command,  nil
       default_config :tls,           false
       default_config :tls_cacert,    nil
       default_config :tls_cert,      nil
       default_config :tls_key,       nil
       default_config :tls_verify,    false
       default_config :tty,           false
+      default_config :use_sudo,      false
       default_config :working_dir,   nil
 
       default_config :socket do |transport|
@@ -64,6 +76,17 @@ module Kitchen
         end
       end
 
+      # Builds a connection to the container.
+      #
+      # +DOCKER_HOST+ is exported here because the docker-api gem, used by the
+      # InSpec verifier, reads the daemon address from the environment rather
+      # than from Test Kitchen's configuration.
+      #
+      # @param state [Hash] instance state naming the container
+      # @param block [Proc, nil] forwarded to the connection's constructor, which
+      #   yields the new connection to it; the connection is not closed afterwards
+      # @yieldparam connection [Connection] if a block is given
+      # @return [Connection]
       def connection(state, &block)
         options = config.to_hash.merge(state)
         options[:platform] = instance.platform.name
@@ -77,10 +100,19 @@ module Kitchen
         Kitchen::Transport::Docker::Connection.new(options, &block)
       end
 
-      class Connection < Kitchen::Transport::Docker::Connection
+      # A connection to one container.
+      #
+      # The superclass is named in full rather than relying on Ruby resolving
+      # the bare `Connection` constant through this class's ancestors.
+      class Connection < Kitchen::Transport::Base::Connection
         # Include the InSpec patches to be able to execute tests on Windows containers
         include Kitchen::Docker::Helpers::InspecHelper
 
+        # Runs a command inside the container.
+        #
+        # @param command [String] the command to run; nil is a no-op
+        # @return [void]
+        # @raise [DockerFailed] if the command fails
         def execute(command)
           return if command.nil?
 
@@ -92,12 +124,20 @@ module Kitchen
           raise DockerFailed, "Docker failed to execute command on container. Error Details: #{e}"
         end
 
+        # Copies local files into the container.
+        #
+        # @param locals [String, Array<String>] one path or several
+        # @param remote [String] destination path inside the container
+        # @return [Array<String>] the files copied
         def upload(locals, remote)
           container.upload(locals, remote)
         end
 
+        # The container implementation for this platform.
+        #
+        # @return [Kitchen::Docker::Container] a Windows or Linux container
         def container
-          @container ||= if @options[:platform].include?("windows")
+          @container ||= if windows_container?
                            Kitchen::Docker::Container::Windows.new(@options)
                          else
                            Kitchen::Docker::Container::Linux.new(@options)
@@ -105,47 +145,62 @@ module Kitchen
           @container
         end
 
+        # The command `kitchen login` execs to open a shell in the container.
+        #
+        # Documented here rather than inherited via `(see ...)`, because the
+        # superclass lives in the test-kitchen gem and YARD cannot resolve a
+        # reference into it from this project's docs.
+        #
+        # @return [Kitchen::LoginCommand] an interactive `docker exec` session
         def login_command
-          config = container.instance_variable_get(:@config)
-          login_config = config.dup
-          login_config[:interactive] = true
-          login_config[:tty] = true
-          login_config[:detach] = false
-          login_config[:username] = nil
-          login_cmd = build_login_command(login_config)
-          LoginCommand.new(login_cmd[0], login_cmd[1..-1])
+          argv = build_login_command
+          LoginCommand.new(argv.first, argv.drop(1))
         end
 
-        def build_login_command(config)
-          # This function duplicates a lot of CliHelper functionality, but I think I'd need to refactor
-          # things to override some aspects of Configurable in order to reuse that code.
-          docker = [config[:binary].dup]
-          docker << "-H #{config[:socket]}" if config[:socket]
-          docker << "--tls" if config[:tls]
-          docker << "--tlsverify" if config[:tls_verify]
-          docker << "--tlscacert=#{config[:tls_cacert]}" if config[:tls_cacert]
-          docker << "--tlscert=#{config[:tls_cert]}" if config[:tls_cert]
-          docker << "--tlskey=#{config[:tls_key]}" if config[:tls_key]
-          logger.debug("docker_command: #{docker.join(" ")}")
+        private
 
+        # @return [Boolean] whether the platform under test is Windows
+        def windows_container?
+          @options[:platform].to_s.include?("windows")
+        end
+
+        # Builds the argv array for an interactive `docker exec` session.
+        #
+        # Kitchen hands the result to `Kernel.exec` in its multi-argument form,
+        # which bypasses the shell entirely. Every flag and its value therefore
+        # has to be its own token -- a packed "-H unix:///var/run/docker.sock"
+        # would reach Docker as a single argument -- and values must not be
+        # quoted, since there is no shell to strip the quotes back off.
+        #
+        # @return [Array<String>] the docker command and its arguments
+        def build_login_command
+          docker = [@options[:binary]]
+          docker.push("-H", @options[:socket]) if @options[:socket]
+          docker << "--tls" if @options[:tls]
+          docker << "--tlsverify" if @options[:tls_verify]
+          docker << "--tlscacert=#{@options[:tls_cacert]}" if @options[:tls_cacert]
+          docker << "--tlscert=#{@options[:tls_cert]}" if @options[:tls_cert]
+          docker << "--tlskey=#{@options[:tls_key]}" if @options[:tls_key]
+
+          # Always attached, always a TTY: a detached or non-interactive exec
+          # would hand back a session the user cannot type into.
           cmd = ["exec"]
-          cmd << "-d" if config[:detach]
-          if config[:env_variables]
-            config[:env_variables].each do |var|
-              cmd << "-e #{var}"
-            end
-          end
-          cmd << "--privileged" if config[:privileged]
-          cmd << "-t" if config[:tty]
-          cmd << "-i" if config[:interactive]
-          cmd << "-u #{config[:username]}" if config[:username]
-          cmd << "-w #{config[:working_dir]}" if config[:working_dir]
-          cmd << "#{config[:container_id]}"
-          cmd << "/bin/bash"
-          cmd << "-login"
-          cmd << "-i"
-          logger.debug("build_exec_command: #{cmd.join(" ")}")
+          cmd << "--privileged" if @options[:privileged]
+          cmd.push("-t", "-i")
+          Hash(@options[:env_variables]).each { |key, value| cmd.push("-e", "#{key}=#{value}") }
+          cmd.push("-u", @options[:username]) if @options[:username]
+          cmd.push("-w", @options[:working_dir]) if @options[:working_dir]
+          cmd << @options[:container_id]
+          cmd.concat(login_shell)
+
+          logger.debug("build_login_command: #{(docker + cmd).join(" ")}")
           docker + cmd
+        end
+
+        # @return [Array<String>] the shell to drop the user into, PowerShell on
+        #   Windows and an interactive login bash elsewhere
+        def login_shell
+          windows_container? ? ["powershell"] : ["/bin/bash", "--login", "-i"]
         end
       end
     end
